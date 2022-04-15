@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,16 @@ func newTestServer() *httptest.Server {
 		w.Write([]byte(r.Header.Get("User-Agent")))
 	})
 
+	mux.HandleFunc("/host_header", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(r.Host))
+	})
+
+	mux.HandleFunc("/custom_header", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(r.Header.Get("Test")))
+	})
+
 	mux.HandleFunc("/base", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(`<!DOCTYPE html>
@@ -165,6 +176,40 @@ func newTestServer() *httptest.Server {
 </body>
 </html>
 		`))
+	})
+
+	mux.HandleFunc("/tabs_and_newlines", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+<title>Test Page</title>
+<base href="/foo	bar/" />
+</head>
+<body>
+<a href="x
+y">link</a>
+</body>
+</html>
+		`))
+	})
+
+	mux.HandleFunc("/foobar/xy", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+<title>Test Page</title>
+</head>
+<body>
+<p>hello</p>
+</body>
+</html>
+		`))
+	})
+
+	mux.HandleFunc("/100%25", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("100 percent"))
 	})
 
 	mux.HandleFunc("/large_binary", func(w http.ResponseWriter, r *http.Request) {
@@ -804,6 +849,23 @@ func TestRedirect(t *testing.T) {
 	c.Visit(ts.URL + "/redirect")
 }
 
+func TestRedirectWithDisallowedURLs(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector()
+	c.DisallowedURLFilters = []*regexp.Regexp{regexp.MustCompile(ts.URL + "/redirected/test")}
+	c.OnHTML("a[href]", func(e *HTMLElement) {
+		u := e.Request.AbsoluteURL(e.Attr("href"))
+		err := c.Visit(u)
+		if !errors.Is(err, ErrForbiddenURL) {
+			t.Error("URL should have been forbidden: " + u)
+		}
+	})
+
+	c.Visit(ts.URL + "/redirect")
+}
+
 func TestBaseTag(t *testing.T) {
 	ts := newTestServer()
 	defer ts.Close()
@@ -850,6 +912,71 @@ func TestBaseTagRelative(t *testing.T) {
 		}
 	})
 	c2.Visit(ts.URL + "/base_relative")
+}
+
+func TestTabsAndNewlines(t *testing.T) {
+	// this test might look odd, but see step 3 of
+	// https://url.spec.whatwg.org/#concept-basic-url-parser
+
+	ts := newTestServer()
+	defer ts.Close()
+
+	visited := map[string]struct{}{}
+	expected := map[string]struct{}{
+		"/tabs_and_newlines": {},
+		"/foobar/xy":         {},
+	}
+
+	c := NewCollector()
+	c.OnResponse(func(res *Response) {
+		visited[res.Request.URL.EscapedPath()] = struct{}{}
+	})
+	c.OnHTML("a[href]", func(e *HTMLElement) {
+		if err := e.Request.Visit(e.Attr("href")); err != nil {
+			t.Errorf("visit failed: %v", err)
+		}
+	})
+
+	if err := c.Visit(ts.URL + "/tabs_and_newlines"); err != nil {
+		t.Errorf("visit failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(visited, expected) {
+		t.Errorf("visited=%v expected=%v", visited, expected)
+	}
+}
+
+func TestLonePercent(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	var visitedPath string
+
+	c := NewCollector()
+	c.OnResponse(func(res *Response) {
+		visitedPath = res.Request.URL.RequestURI()
+	})
+	if err := c.Visit(ts.URL + "/100%"); err != nil {
+		t.Errorf("visit failed: %v", err)
+	}
+	// Automatic encoding is not really correct: browsers
+	// would send bare percent here. However, Go net/http
+	// cannot send such requests due to
+	// https://github.com/golang/go/issues/29808. So we have two
+	// alternatives really: return an error when attempting
+	// to fetch such URLs, or at least try the encoded variant.
+	// This test checks that the latter is attempted.
+	if got, want := visitedPath, "/100%25"; got != want {
+		t.Errorf("got=%q want=%q", got, want)
+	}
+	// invalid URL escape in query component is not a problem,
+	// but check it anyway
+	if err := c.Visit(ts.URL + "/?a=100%zz"); err != nil {
+		t.Errorf("visit failed: %v", err)
+	}
+	if got, want := visitedPath, "/?a=100%zz"; got != want {
+		t.Errorf("got=%q want=%q", got, want)
+	}
 }
 
 func TestCollectorCookies(t *testing.T) {
@@ -1055,6 +1182,41 @@ func TestUserAgent(t *testing.T) {
 		c.Request("GET", ts.URL+"/user_agent", nil, nil, hdr)
 		if got, want := receivedUserAgent, exampleUserAgent2; got != want {
 			t.Errorf("mismatched User-Agent (hdr with UA): got=%q want=%q", got, want)
+		}
+	}()
+}
+
+func TestHeaders(t *testing.T) {
+	const exampleHostHeader = "example.com"
+	const exampleTestHeader = "Testing"
+
+	ts := newTestServer()
+	defer ts.Close()
+
+	var receivedHeader string
+
+	func() {
+		c := NewCollector(
+			Headers(map[string]string{"Host": exampleHostHeader}),
+		)
+		c.OnResponse(func(resp *Response) {
+			receivedHeader = string(resp.Body)
+		})
+		c.Visit(ts.URL + "/host_header")
+		if got, want := receivedHeader, exampleHostHeader; got != want {
+			t.Errorf("mismatched Host header: got=%q want=%q", got, want)
+		}
+	}()
+	func() {
+		c := NewCollector(
+			Headers(map[string]string{"Test": exampleTestHeader}),
+		)
+		c.OnResponse(func(resp *Response) {
+			receivedHeader = string(resp.Body)
+		})
+		c.Visit(ts.URL + "/custom_header")
+		if got, want := receivedHeader, exampleTestHeader; got != want {
+			t.Errorf("mismatched custom header: got=%q want=%q", got, want)
 		}
 	}()
 }
